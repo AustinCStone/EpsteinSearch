@@ -1,0 +1,25 @@
+# Environment
+.env
+venv/
+__pycache__/
+*.pyc
+
+# Data (large files)
+data/
+vector_store/
+
+# Keep directory structure
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!vector_store/.gitkeep
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+.claude
+
+# Logs
+*.log
