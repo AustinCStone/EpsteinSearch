@@ -8,7 +8,7 @@ import logging
 
 import faiss
 
-from .config import VECTOR_STORE_DIR, TOP_K_RESULTS
+from .config import VECTOR_STORE_DIR, PROCESSED_DATA_DIR, TOP_K_RESULTS
 from .embeddings import get_embedding_dimension, embed_query
 
 logging.basicConfig(level=logging.INFO)
@@ -80,14 +80,53 @@ class VectorStore:
         scores, indices = self.index.search(query_np, top_k)
 
         results = []
+        seen_sources = set()
         for score, idx in zip(scores[0], indices[0]):
             if idx < 0:  # FAISS returns -1 for not found
                 continue
             result = self.metadata[idx].copy()
             result["score"] = float(score)
+
+            # Deduplicate by source document
+            source = result.get("source", "")
+            if source in seen_sources:
+                continue
+            seen_sources.add(source)
+
+            # Load full document text
+            full_text = self._load_full_text(source)
+            if full_text is not None:
+                result["full_text"] = full_text
+
             results.append(result)
 
         return results
+
+    def _load_full_text(self, source: str) -> Optional[str]:
+        """Load full document text from processed directory by source stem."""
+        # Build lookup cache on first call
+        if not hasattr(self, '_source_to_path'):
+            self._source_to_path = {}
+            if PROCESSED_DATA_DIR.exists():
+                for ds_dir in PROCESSED_DATA_DIR.iterdir():
+                    if ds_dir.is_dir():
+                        txt_path = ds_dir / f"{source}.txt"
+                        if txt_path.exists():
+                            self._source_to_path[source] = txt_path
+
+        # Check cache, or search if not found yet
+        if source not in self._source_to_path:
+            for ds_dir in PROCESSED_DATA_DIR.iterdir():
+                if ds_dir.is_dir():
+                    txt_path = ds_dir / f"{source}.txt"
+                    if txt_path.exists():
+                        self._source_to_path[source] = txt_path
+                        break
+
+        path = self._source_to_path.get(source)
+        if path and path.exists():
+            return path.read_text(encoding="utf-8")
+        return None
 
     def search_text(self, query: str, top_k: int = TOP_K_RESULTS) -> list[dict]:
         """Search using a text query (embeds automatically)."""

@@ -20,7 +20,7 @@ if GEMINI_API_KEY:
 # Embedding settings
 EMBED_MODEL = "models/gemini-embedding-001"
 EMBED_BATCH_SIZE = 100   # texts per API call (max 250)
-PARALLEL_REQUESTS = 200  # concurrent API calls (Tier 3: 4000+ RPM = ~67/sec)
+PARALLEL_REQUESTS = 10   # concurrent API calls (conservative for Tier 3: 20K RPM)
 EMBED_DIM = 768          # output dimension
 
 
@@ -33,8 +33,12 @@ def normalize(vectors: list[list[float]]) -> list[list[float]]:
     return normalized.tolist()
 
 
-def batch_embed(texts: list[str], retries: int = 3) -> list[list[float]]:
-    """Embed a batch of texts with retry logic."""
+EMBED_MAX_RETRIES = 8
+EMBED_RETRY_CAP = 300  # max 5 minutes between retries
+
+
+def batch_embed(texts: list[str], retries: int = EMBED_MAX_RETRIES) -> list[list[float]]:
+    """Embed a batch of texts with exponential backoff (capped at 5 min)."""
     for attempt in range(retries):
         try:
             result = genai.embed_content(
@@ -46,8 +50,8 @@ def batch_embed(texts: list[str], retries: int = 3) -> list[list[float]]:
             return result["embedding"]
         except Exception as e:
             if attempt < retries - 1:
-                wait_time = 2 ** attempt
-                logger.warning(f"Embed error: {e}. Retrying in {wait_time}s...")
+                wait_time = min(2 ** (attempt + 1), EMBED_RETRY_CAP)
+                logger.warning(f"Embed error (attempt {attempt + 1}/{retries}): {e}. Retrying in {wait_time}s...")
                 time.sleep(wait_time)
             else:
                 raise

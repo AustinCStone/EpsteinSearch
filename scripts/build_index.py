@@ -48,8 +48,8 @@ def main():
     parser.add_argument(
         "--batch-size", "-b",
         type=int,
-        default=EMBEDDING_BATCH_SIZE,
-        help="Embedding batch size"
+        default=5000,
+        help="Texts per embedding round (default: 5000, feeds 50 API sub-batches to thread pool)"
     )
     parser.add_argument(
         "--no-gpu",

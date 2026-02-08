@@ -7,7 +7,10 @@ with pymupdf extraction, re-chunks, and overwrites output files.
 
 Deletes _ocr_pages.json on success → built-in resume support.
 
-Uses ThreadPoolExecutor since OCR is I/O-bound (API calls).
+Architecture: Process manifests in small batches. For each batch:
+  1. Render pages and submit OCR tasks (streaming, not all at once)
+  2. Collect results
+  3. Reassemble text, re-chunk, save, delete manifests
 """
 
 import argparse
@@ -43,89 +46,135 @@ def find_ocr_manifests(base_dir: Path, datasets: list[str] | None = None) -> lis
     return sorted(base_dir.glob("**/*_ocr_pages.json"))
 
 
-def process_one_manifest(manifest_path: Path) -> tuple[str, int, bool, str]:
-    """
-    Process a single OCR manifest: render pages, OCR, merge, re-chunk, save.
+def ocr_page_from_pdf(pdf_path: str, page_idx: int) -> str:
+    """Render a single PDF page and OCR it. Opens/closes PDF each time to avoid holding memory."""
+    import fitz
+    from PIL import Image
 
-    Returns:
-        (filename, num_ocr_pages, success, error_msg)
+    doc = fitz.open(pdf_path)
+    page = doc[page_idx]
+    pix = page.get_pixmap(dpi=OCR_DPI)
+    img = Image.open(io.BytesIO(pix.tobytes("png")))
+    doc.close()
+
+    return ocr_image_single(img)
+
+
+def process_batch_of_manifests(manifest_batch: list[Path], max_workers: int) -> tuple[int, int, int]:
+    """
+    Process a batch of manifests with page-level OCR parallelism.
+
+    Returns: (processed_count, ocr_pages_count, failed_count)
     """
     import fitz
     from langchain_text_splitters import RecursiveCharacterTextSplitter
-    from PIL import Image
 
-    try:
-        with open(manifest_path) as f:
-            manifest = json.load(f)
+    # Parse all manifests
+    items = []
+    for manifest_path in manifest_batch:
+        try:
+            with open(manifest_path) as f:
+                manifest = json.load(f)
+            source_pdf = Path(manifest["source_pdf"])
+            if not source_pdf.exists():
+                logger.error(f"Source PDF not found: {source_pdf}")
+                items.append(None)
+                continue
+            items.append({
+                "manifest_path": manifest_path,
+                "stem": manifest_path.stem.replace("_ocr_pages", ""),
+                "parent_dir": manifest_path.parent,
+                "source_pdf": str(source_pdf),
+                "ocr_page_indices": manifest["pages"],
+                "total_pages": manifest["total_pages"],
+                "ocr_results": {},
+            })
+        except Exception as e:
+            logger.error(f"Failed to read manifest {manifest_path}: {e}")
+            items.append(None)
 
-        ocr_page_indices = manifest["pages"]
-        total_pages = manifest["total_pages"]
-        source_pdf = Path(manifest["source_pdf"])
-        stem = manifest_path.stem.replace("_ocr_pages", "")
-        parent_dir = manifest_path.parent
+    # Submit all page OCR tasks to thread pool
+    # Each task opens its own PDF handle, renders one page, OCRs it, closes — no memory accumulation
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_info = {}
+        for item_idx, item in enumerate(items):
+            if item is None:
+                continue
+            for page_idx in item["ocr_page_indices"]:
+                future = executor.submit(ocr_page_from_pdf, item["source_pdf"], page_idx)
+                future_to_info[future] = (item_idx, page_idx)
 
-        if not source_pdf.exists():
-            return stem, 0, False, f"Source PDF not found: {source_pdf}"
+        for future in as_completed(future_to_info):
+            item_idx, page_idx = future_to_info[future]
+            try:
+                ocr_text = future.result()
+                items[item_idx]["ocr_results"][page_idx] = ocr_text
+            except Exception as e:
+                logger.error(f"OCR failed for item {item_idx} page {page_idx}: {e}")
 
-        # Open PDF and extract text per page + OCR flagged pages
-        doc = fitz.open(str(source_pdf))
-        ocr_set = set(ocr_page_indices)
-        pages_text = []
+    # Reassemble text, re-chunk, save
+    processed = 0
+    total_ocr = 0
+    failed = 0
 
-        for page_idx in range(len(doc)):
-            page = doc[page_idx]
-            pymupdf_text = page.get_text().strip()
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+        separators=["\n\n", "\n", ". ", " ", ""],
+    )
 
-            if page_idx in ocr_set:
-                # Render to image and OCR
-                pix = page.get_pixmap(dpi=OCR_DPI)
-                img = Image.open(io.BytesIO(pix.tobytes("png")))
-                ocr_text = ocr_image_single(img)
+    for item in items:
+        if item is None:
+            failed += 1
+            continue
+        try:
+            doc = fitz.open(item["source_pdf"])
+            ocr_set = set(item["ocr_page_indices"])
+            pages_text = []
 
-                # Use OCR text if it's longer/better than pymupdf text
-                if len(ocr_text) > len(pymupdf_text):
-                    pages_text.append(ocr_text)
+            for page_idx in range(len(doc)):
+                page = doc[page_idx]
+                pymupdf_text = page.get_text().strip()
+
+                if page_idx in ocr_set and page_idx in item["ocr_results"]:
+                    ocr_text = item["ocr_results"][page_idx]
+                    if len(ocr_text) > len(pymupdf_text):
+                        pages_text.append(ocr_text)
+                    else:
+                        pages_text.append(pymupdf_text)
                 else:
                     pages_text.append(pymupdf_text)
-            else:
-                pages_text.append(pymupdf_text)
 
-        doc.close()
+            doc.close()
 
-        # Reassemble full text
-        text = '\n\n'.join(pages_text)
-        text = re.sub(r'\n{3,}', '\n\n', text)
-        text = re.sub(r' {2,}', ' ', text)
-        text = text.strip()
+            text = '\n\n'.join(pages_text)
+            text = re.sub(r'\n{3,}', '\n\n', text)
+            text = re.sub(r' {2,}', ' ', text)
+            text = text.strip()
 
-        # Re-chunk
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=CHUNK_SIZE,
-            chunk_overlap=CHUNK_OVERLAP,
-            separators=["\n\n", "\n", ". ", " ", ""],
-        )
-        chunk_texts = splitter.split_text(text)
-        chunks = [
-            {"text": c, "source": stem, "chunk_index": i}
-            for i, c in enumerate(chunk_texts)
-        ]
+            chunk_texts = splitter.split_text(text)
+            chunks = [
+                {"text": c, "source": item["stem"], "chunk_index": i}
+                for i, c in enumerate(chunk_texts)
+            ]
 
-        # Overwrite .txt and _chunks.json
-        text_path = parent_dir / f"{stem}.txt"
-        with open(text_path, "w", encoding="utf-8") as f:
-            f.write(text)
+            text_path = item["parent_dir"] / f"{item['stem']}.txt"
+            with open(text_path, "w", encoding="utf-8") as f:
+                f.write(text)
 
-        chunks_path = parent_dir / f"{stem}_chunks.json"
-        with open(chunks_path, "w") as f:
-            json.dump(chunks, f)
+            chunks_path = item["parent_dir"] / f"{item['stem']}_chunks.json"
+            with open(chunks_path, "w") as f:
+                json.dump(chunks, f)
 
-        # Delete manifest (resume marker)
-        manifest_path.unlink()
+            item["manifest_path"].unlink()
+            processed += 1
+            total_ocr += len(item["ocr_page_indices"])
 
-        return stem, len(ocr_page_indices), True, ""
+        except Exception as e:
+            logger.error(f"Failed to save {item['stem']}: {e}")
+            failed += 1
 
-    except Exception as e:
-        return manifest_path.stem, 0, False, str(e)
+    return processed, total_ocr, failed
 
 
 def main():
@@ -136,6 +185,8 @@ def main():
                         help="Process specific dataset(s)")
     parser.add_argument("--limit", "-l", type=int,
                         help="Limit number of manifests to process")
+    parser.add_argument("--batch-size", "-b", type=int, default=200,
+                        help="Manifests per batch (default: 200)")
     parser.add_argument("--stats-only", action="store_true",
                         help="Show stats without processing")
     args = parser.parse_args()
@@ -175,46 +226,43 @@ def main():
 
     if args.limit:
         manifests = manifests[:args.limit]
+        total_pages = 0
+        for m in manifests:
+            with open(m) as f:
+                data = json.load(f)
+                total_pages += len(data["pages"])
 
-    # Process manifests. Each manifest processes its pages sequentially (one PDF),
-    # but multiple manifests run concurrently via ThreadPoolExecutor.
-    # The concurrency here is at the manifest level. Within each manifest,
-    # pages are OCR'd sequentially to keep memory bounded.
-    # With 200 workers and most PDFs being 1-2 pages, effective parallelism ≈ 200 API calls.
     total_manifests = len(manifests)
-    logger.info(f"Processing {total_manifests} manifests ({total_pages} OCR pages) with {args.workers} threads")
+    logger.info(f"Processing {total_manifests} manifests ({total_pages} OCR pages) "
+                f"with {args.workers} threads, batch size {args.batch_size}")
 
     processed = 0
     total_ocr_done = 0
     failed = 0
     start_time = time.time()
 
-    with ThreadPoolExecutor(max_workers=args.workers) as executor:
-        futures = {executor.submit(process_one_manifest, m): m for m in manifests}
+    for batch_start in range(0, total_manifests, args.batch_size):
+        batch = manifests[batch_start:batch_start + args.batch_size]
+        batch_num = batch_start // args.batch_size + 1
+        total_batches = (total_manifests + args.batch_size - 1) // args.batch_size
+        logger.info(f"=== Batch {batch_num}/{total_batches}: {len(batch)} manifests ===")
 
-        for future in as_completed(futures):
-            stem, n_pages, success, error = future.result()
-            if success:
-                processed += 1
-                total_ocr_done += n_pages
-            else:
-                failed += 1
-                if failed <= 50:
-                    logger.error(f"Failed: {stem}: {error}")
+        bp, bo, bf = process_batch_of_manifests(batch, args.workers)
+        processed += bp
+        total_ocr_done += bo
+        failed += bf
 
-            done = processed + failed
-            if done % 100 == 0 or done == total_manifests:
-                elapsed = time.time() - start_time
-                pages_rate = total_ocr_done / elapsed if elapsed > 0 else 0
-                remaining_pages = total_pages - total_ocr_done
-                remaining_min = remaining_pages / pages_rate / 60 if pages_rate > 0 else 0
-                logger.info(
-                    f"Progress: {done}/{total_manifests} files | "
-                    f"{total_ocr_done}/{total_pages} pages | "
-                    f"{pages_rate:.1f} pages/sec | "
-                    f"~{remaining_min:.0f} min remaining | "
-                    f"{failed} failed"
-                )
+        elapsed = time.time() - start_time
+        pages_rate = total_ocr_done / elapsed if elapsed > 0 else 0
+        remaining_pages = total_pages - total_ocr_done
+        remaining_min = remaining_pages / pages_rate / 60 if pages_rate > 0 else 0
+        logger.info(
+            f"Progress: {processed + failed}/{total_manifests} files | "
+            f"{total_ocr_done}/{total_pages} pages | "
+            f"{pages_rate:.1f} pages/sec | "
+            f"~{remaining_min:.0f} min remaining | "
+            f"{failed} failed"
+        )
 
     elapsed = time.time() - start_time
     print(f"\n{'='*60}")

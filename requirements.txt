@@ -21,5 +21,6 @@ tqdm>=4.66.0
 # OCR (using Gemini vision)
 Pillow
 
-# Optional: Web UI
-# gradio>=4.0.0
+# Web UI
+fastapi>=0.115.0
+uvicorn>=0.30.0
