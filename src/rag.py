@@ -1,8 +1,9 @@
 """RAG query system using Gemini or GPT-5."""
 
+import json as _json
 import google.generativeai as genai
 from openai import AzureOpenAI
-from typing import Optional
+from typing import Generator, Optional
 import logging
 import os
 
@@ -172,3 +173,105 @@ def ask_with_context(question: str, context_texts: list[str]) -> str:
     context = "\n\n---\n\n".join(f"[Excerpt {i+1}]\n{text}" for i, text in enumerate(context_texts))
     prompt = compose_prompt(question, context)
     return query_gemini(prompt)
+
+
+# ---------------------------------------------------------------------------
+# Multi-query RAG with streaming
+# ---------------------------------------------------------------------------
+
+QUERY_GEN_PROMPT = """You are a search query optimizer for a document retrieval system containing the Epstein court documents (depositions, emails, FBI reports, financial records, travel logs, etc.).
+
+Given the user's question, generate 5-10 diverse search queries that would retrieve the most relevant document chunks. Each query should:
+- Target different aspects or phrasings of the question
+- Use specific names, dates, or terminology likely to appear in legal documents
+- Be concise (under 20 words each)
+- We are searching an embedding vector store which indexes based on semantic similarity, so prefer queries which will have similar semantics to the thing you are ultimately looking for.
+
+Return ONLY a JSON array of strings, no other text.
+
+User question: {question}"""
+
+
+def generate_search_queries(question: str) -> list[str]:
+    """Use the LLM to generate optimized search queries from a user question."""
+    prompt = QUERY_GEN_PROMPT.format(question=question)
+    try:
+        raw = query_llm(prompt)
+        raw = raw.strip()
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[1]
+            if raw.endswith("```"):
+                raw = raw[:-3]
+            raw = raw.strip()
+        queries = _json.loads(raw)
+        if isinstance(queries, list) and all(isinstance(q, str) for q in queries):
+            return queries[:10]
+    except Exception as e:
+        logger.warning(f"Failed to parse search queries from LLM: {e}. Falling back to raw question.")
+    return [question]
+
+
+def merge_results(all_results: list[list[dict]], top_k: int) -> list[dict]:
+    """Merge results from multiple queries, keeping best score per source."""
+    best_by_source: dict[str, dict] = {}
+    for results in all_results:
+        for r in results:
+            source = r.get("source", "")
+            score = r.get("score", 0)
+            if source not in best_by_source or score > best_by_source[source].get("score", 0):
+                best_by_source[source] = r
+    merged = sorted(best_by_source.values(), key=lambda r: r.get("score", 0), reverse=True)
+    return merged[:top_k]
+
+
+def ask_streaming(
+    question: str,
+    top_k: int = TOP_K_RESULTS,
+) -> Generator[dict, None, None]:
+    """Streaming RAG pipeline that yields SSE event dicts."""
+    # Step 1: Generate search queries
+    yield {"type": "status", "message": "Generating search queries..."}
+
+    queries = generate_search_queries(question)
+    yield {"type": "queries", "queries": queries}
+
+    # Step 2: Execute searches
+    yield {"type": "status", "message": f"Searching {len(queries)} queries..."}
+
+    all_results = []
+    for q in queries:
+        results = search(q, top_k=top_k)
+        all_results.append(results)
+
+    # Step 3: Merge and deduplicate
+    merged = merge_results(all_results, top_k=top_k)
+
+    if not merged:
+        yield {"type": "answer", "answer": "No relevant documents found."}
+        yield {"type": "sources", "sources": []}
+        return
+
+    sources_for_client = [
+        {
+            "text": r.get("text", "")[:500] + ("..." if len(r.get("text", "")) > 500 else ""),
+            "full_text": r.get("full_text", ""),
+            "source": r.get("source", "Unknown"),
+            "score": round(r.get("score", 0), 4),
+        }
+        for r in merged
+    ]
+    yield {"type": "sources", "sources": sources_for_client}
+
+    # Step 4: Generate LLM answer
+    yield {"type": "status", "message": "Generating answer..."}
+
+    context = format_context(merged[:50])
+    prompt = compose_prompt(question, context)
+
+    try:
+        answer = query_llm(prompt)
+    except Exception as e:
+        yield {"type": "error", "message": f"LLM error: {e}"}
+        return
+
+    yield {"type": "answer", "answer": answer}

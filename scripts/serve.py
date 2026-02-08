@@ -4,19 +4,19 @@
 import sys
 sys.path.insert(0, "/storage/epstein_llm")
 
+import json
 import logging
 import re
 import time
 from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse
 from pydantic import BaseModel
 import uvicorn
 
 from src.vectorstore import search as vector_search, get_vector_store
-from src.rag import ask
-from src.download_doj import DATA_SETS
+from src.rag import ask, ask_streaming
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -29,6 +29,44 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+RAW_DIR = Path("/storage/epstein_llm/data/raw/doj_2026")
+
+# Full index: EFTA source stem -> Path on disk (built once at startup)
+_pdf_index: dict[str, Path] = {}
+_pdf_index_built = False
+
+
+def _build_pdf_index():
+    """Scan all PDFs under RAW_DIR once and index by stem."""
+    global _pdf_index_built
+    if _pdf_index_built:
+        return
+    logger.info("Building PDF path index...")
+    t0 = time.time()
+    count = 0
+    for pdf in RAW_DIR.rglob("EFTA*.pdf"):
+        stem = pdf.stem  # e.g. EFTA00081180
+        if stem not in _pdf_index:
+            _pdf_index[stem] = pdf
+            count += 1
+    _pdf_index_built = True
+    logger.info(f"PDF index ready — {count:,} files in {time.time()-t0:.1f}s")
+
+
+def _find_pdf(source: str) -> Path | None:
+    """Find the on-disk PDF for a source like EFTA01262782."""
+    if not _pdf_index_built:
+        _build_pdf_index()
+    return _pdf_index.get(source)
+
+
+def _pdf_url(source: str) -> str | None:
+    """Return the local API URL for a source's PDF, or None."""
+    if not source.startswith("EFTA"):
+        return None
+    return f"/api/pdf/{source}"
 
 
 class QueryRequest(BaseModel):
@@ -45,6 +83,7 @@ async def startup():
     t0 = time.time()
     store = get_vector_store()
     logger.info(f"Vector store ready — {store.size:,} vectors loaded in {time.time()-t0:.1f}s")
+    _build_pdf_index()
 
 
 # ---------------------------------------------------------------------------
@@ -62,6 +101,7 @@ async def api_search(req: QueryRequest):
                 "score": round(r.get("score", 0), 4),
                 "text": r.get("text", ""),
                 "full_text": r.get("full_text", ""),
+                "pdf_url": _pdf_url(r.get("source", "")),
             }
             for r in results
         ],
@@ -70,9 +110,30 @@ async def api_search(req: QueryRequest):
 
 @app.post("/api/ask")
 async def api_ask(req: QueryRequest):
-    """Full RAG pipeline — retrieval + LLM answer."""
-    result = ask(req.query, top_k=req.top_k, show_sources=True)
-    return result
+    """Full RAG pipeline with SSE streaming — retrieval + LLM answer."""
+
+    def event_stream():
+        for event in ask_streaming(req.query, top_k=req.top_k):
+            if event.get("type") == "sources":
+                for s in event.get("sources", []):
+                    s["pdf_url"] = _pdf_url(s.get("source", ""))
+            yield f"data: {json.dumps(event)}\n\n"
+        yield 'data: {"type": "done"}\n\n'
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/api/pdf/{source}")
+async def api_pdf(source: str):
+    """Serve a raw PDF from disk by source ID (e.g. EFTA01262782)."""
+    path = _find_pdf(source)
+    if path is None:
+        raise HTTPException(status_code=404, detail=f"PDF not found for {source}")
+    return FileResponse(path, media_type="application/pdf", filename=f"{source}.pdf")
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +146,7 @@ HTML_PAGE = """\
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Epstein Documents RAG</title>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <style>
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -217,6 +279,34 @@ header p {
 
 .status.error { color: var(--red); }
 
+/* Generated queries display */
+.queries-box {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 12px 16px;
+  margin-bottom: 16px;
+}
+
+.queries-box .label {
+  font-size: 11px;
+  color: var(--accent);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin-bottom: 8px;
+}
+
+.query-chip {
+  display: inline-block;
+  background: rgba(201, 168, 76, 0.1);
+  border: 1px solid var(--accent-dim);
+  border-radius: 3px;
+  padding: 4px 10px;
+  margin: 3px 4px;
+  font-size: 12px;
+  color: var(--text);
+}
+
 /* Answer box */
 .answer-box {
   background: var(--surface);
@@ -225,7 +315,6 @@ header p {
   border-radius: 4px;
   padding: 20px 24px;
   margin-bottom: 24px;
-  white-space: pre-wrap;
   line-height: 1.7;
 }
 
@@ -236,6 +325,34 @@ header p {
   letter-spacing: 0.08em;
   margin-bottom: 12px;
 }
+
+/* Markdown content styling */
+.answer-content { white-space: normal; }
+.answer-content h1, .answer-content h2, .answer-content h3 {
+  color: var(--accent);
+  margin: 16px 0 8px;
+  font-size: 15px;
+}
+.answer-content h1 { font-size: 17px; }
+.answer-content p { margin-bottom: 10px; }
+.answer-content ul, .answer-content ol {
+  margin: 8px 0 8px 20px;
+}
+.answer-content li { margin-bottom: 4px; }
+.answer-content code {
+  background: rgba(255,255,255,0.06);
+  padding: 2px 6px;
+  border-radius: 3px;
+  font-size: 13px;
+}
+.answer-content blockquote {
+  border-left: 3px solid var(--accent-dim);
+  padding-left: 12px;
+  color: var(--text-dim);
+  margin: 10px 0;
+}
+.answer-content strong { color: #fff; }
+.answer-content a { color: var(--accent); }
 
 /* Results */
 .results-header {
@@ -285,6 +402,21 @@ header p {
   border-radius: 3px;
 }
 
+.pdf-link {
+  font-size: 11px;
+  color: var(--accent);
+  text-decoration: none;
+  padding: 2px 8px;
+  border: 1px solid var(--accent-dim);
+  border-radius: 3px;
+  transition: all 0.2s;
+}
+
+.pdf-link:hover {
+  background: var(--accent-dim);
+  color: #fff;
+}
+
 .source-header .toggle {
   color: var(--text-dim);
   font-size: 12px;
@@ -328,6 +460,29 @@ header p {
   50% { opacity: 1; }
 }
 .loading { animation: pulse 1.5s ease-in-out infinite; }
+
+/* Generating answer banner */
+.generating-banner {
+  background: var(--surface);
+  border: 1px solid var(--accent-dim);
+  border-left: 3px solid var(--accent);
+  border-radius: 4px;
+  padding: 20px 24px;
+  margin-bottom: 24px;
+  font-size: 15px;
+  color: var(--accent);
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
+.generating-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  background: var(--accent);
+  border-radius: 50%;
+  margin-right: 4px;
+  animation: pulse 1s ease-in-out infinite;
+}
 </style>
 </head>
 <body>
@@ -339,27 +494,32 @@ header p {
 
   <div class="search-box">
     <input type="text" id="query" placeholder="Search documents or ask a question..." autofocus>
-    <button id="submit" onclick="doQuery()">Search</button>
+    <button id="submit" onclick="doQuery()">Ask</button>
   </div>
 
   <div class="mode-toggle">
-    <label id="mode-search" class="active" onclick="setMode('search')">
-      <input type="radio" name="mode" value="search" checked>
+    <label id="mode-search" onclick="setMode('search')">
+      <input type="radio" name="mode" value="search">
       Search &mdash; fast vector lookup
     </label>
-    <label id="mode-ask" onclick="setMode('ask')">
-      <input type="radio" name="mode" value="ask">
+    <label id="mode-ask" class="active" onclick="setMode('ask')">
+      <input type="radio" name="mode" value="ask" checked>
       Ask &mdash; RAG with LLM answer
     </label>
   </div>
 
   <div class="status" id="status"></div>
+  <div id="queries-container"></div>
   <div id="answer-container"></div>
   <div id="results-container"></div>
+
+  <footer style="text-align:center; margin-top:48px; padding:16px 0; border-top:1px solid var(--border); font-size:11px; color:var(--text-dim);">
+    Contact: <a href="mailto:partlyshady@gmail.com" style="color:var(--accent);">partlyshady@gmail.com</a>
+  </footer>
 </div>
 
 <script>
-let mode = "search";
+let mode = "ask";
 
 function setMode(m) {
   mode = m;
@@ -380,66 +540,139 @@ async function doQuery() {
   const status = document.getElementById("status");
   const answerC = document.getElementById("answer-container");
   const resultsC = document.getElementById("results-container");
+  const queriesC = document.getElementById("queries-container");
 
   btn.disabled = true;
   answerC.innerHTML = "";
   resultsC.innerHTML = "";
+  queriesC.innerHTML = "";
   status.className = "status loading";
-  status.textContent = mode === "search" ? "Searching vectors..." : "Querying LLM — this may take a moment...";
 
-  const endpoint = mode === "search" ? "/api/search" : "/api/ask";
   const t0 = performance.now();
 
+  if (mode === "search") {
+    status.textContent = "Searching vectors...";
+    try {
+      const resp = await fetch("/api/search", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query, top_k: 100 }),
+      });
+      if (!resp.ok) throw new Error("HTTP " + resp.status);
+      const data = await resp.json();
+      const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+      renderSources(data.results, elapsed, resultsC);
+      status.className = "status";
+      status.textContent = data.results.length > 0
+        ? data.results.length + " results in " + elapsed + "s"
+        : "No results found.";
+    } catch (err) {
+      status.className = "status error";
+      status.textContent = "Error: " + err.message;
+    } finally {
+      btn.disabled = false;
+    }
+    return;
+  }
+
+  // Ask mode: SSE streaming
+  status.textContent = "Starting RAG pipeline...";
   try {
-    const resp = await fetch(endpoint, {
+    const resp = await fetch("/api/ask", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ query, top_k: 10 }),
+      body: JSON.stringify({ query, top_k: 100 }),
     });
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
 
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const data = await resp.json();
-    const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
 
-    // LLM answer (ask mode)
-    if (mode === "ask" && data.answer) {
-      answerC.innerHTML = `<div class="answer-box"><div class="label">LLM Answer</div>${escapeHtml(data.answer)}</div>`;
+    while (true) {
+      const { done, value } = reader.read ? await reader.read() : { done: true };
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      const lines = buffer.split("\\n");
+      buffer = lines.pop();
+
+      for (const line of lines) {
+        if (!line.startsWith("data: ")) continue;
+        let event;
+        try { event = JSON.parse(line.slice(6)); } catch { continue; }
+
+        switch (event.type) {
+          case "status":
+            status.textContent = event.message;
+            break;
+
+          case "queries":
+            queriesC.innerHTML = renderQueries(event.queries);
+            break;
+
+          case "sources": {
+            const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+            renderSources(event.sources, elapsed, resultsC);
+            status.className = "status";
+            status.textContent = "";
+            answerC.innerHTML = '<div class="generating-banner"><span class="generating-dot"></span> Generating answer &mdash; analyzing ' + Math.min(event.sources.length, 50) + ' sources...</div>';
+            break;
+          }
+
+          case "answer": {
+            const render = typeof marked !== "undefined" ? marked.parse(event.answer) : escapeHtml(event.answer);
+            answerC.innerHTML = '<div class="answer-box"><div class="label">LLM Answer</div><div class="answer-content">' + render + '</div></div>';
+            const elapsed2 = ((performance.now() - t0) / 1000).toFixed(1);
+            status.className = "status";
+            status.textContent = "Done in " + elapsed2 + "s";
+            break;
+          }
+
+          case "error":
+            status.className = "status error";
+            status.textContent = "Error: " + event.message;
+            break;
+        }
+      }
     }
-
-    // Source documents
-    const sources = mode === "search" ? data.results : (data.sources || []);
-    if (sources.length > 0) {
-      let html = `<div class="results-header">${sources.length} source documents (${elapsed}s)</div>`;
-      sources.forEach((s, i) => {
-        const snippet = (s.text || "").substring(0, 300).replace(/\\n/g, " ");
-        const fullText = s.full_text || s.text || "";
-        html += `
-          <div class="source-card">
-            <div class="source-header" onclick="toggleCard(${i})">
-              <div class="meta">
-                <span class="doc-id">${escapeHtml(s.source || "Unknown")}</span>
-                <span class="score">${(s.score || 0).toFixed(4)}</span>
-              </div>
-              <span class="toggle" id="toggle-${i}">&#9654;</span>
-            </div>
-            <div class="source-snippet">${escapeHtml(snippet)}${snippet.length >= 300 ? "..." : ""}</div>
-            <div class="source-full" id="full-${i}">${escapeHtml(fullText)}</div>
-          </div>`;
-      });
-      resultsC.innerHTML = html;
-    }
-
-    status.className = "status";
-    status.textContent = sources.length > 0
-      ? `${sources.length} results in ${elapsed}s`
-      : "No results found.";
-
   } catch (err) {
     status.className = "status error";
     status.textContent = "Error: " + err.message;
   } finally {
     btn.disabled = false;
   }
+}
+
+function renderQueries(queries) {
+  let chips = "";
+  for (const q of queries) chips += '<div class="query-chip">' + escapeHtml(q) + '</div>';
+  return '<div class="queries-box"><div class="label">Generated Search Queries</div>' + chips + '</div>';
+}
+
+function renderSources(sources, elapsed, container) {
+  if (!sources || sources.length === 0) { container.innerHTML = ""; return; }
+  let html = '<div class="results-header">' + sources.length + ' source documents (' + elapsed + 's)</div>';
+  sources.forEach(function(s, i) {
+    const snippet = (s.text || "").substring(0, 300).replace(/\\n/g, " ");
+    const fullText = s.full_text || s.text || "";
+    const pdfLink = s.pdf_url
+      ? '<a class="pdf-link" href="' + escapeHtml(s.pdf_url) + '" target="_blank" rel="noopener" onclick="event.stopPropagation()">View PDF</a>'
+      : "";
+    html += '<div class="source-card">'
+      + '<div class="source-header" onclick="toggleCard(' + i + ')">'
+      + '<div class="meta">'
+      + '<span class="doc-id">' + escapeHtml(s.source || "Unknown") + '</span>'
+      + '<span class="score">' + (s.score || 0).toFixed(4) + '</span>'
+      + pdfLink
+      + '</div>'
+      + '<span class="toggle" id="toggle-' + i + '">&#9654;</span>'
+      + '</div>'
+      + '<div class="source-snippet">' + escapeHtml(snippet) + (snippet.length >= 300 ? "..." : "") + '</div>'
+      + '<div class="source-full" id="full-' + i + '">' + escapeHtml(fullText) + '</div>'
+      + '</div>';
+  });
+  container.innerHTML = html;
 }
 
 function toggleCard(i) {

@@ -39,7 +39,7 @@ EMBEDDING_DEVICE = "cuda"  # or "cpu"
 FAISS_INDEX_TYPE = "flat"  # or "ivf" for larger datasets
 
 # Retrieval settings
-TOP_K_RESULTS = 10
+TOP_K_RESULTS = 100
 
 # Gemini settings
 GEMINI_MODEL = "gemini-3-flash-preview"
