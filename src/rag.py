@@ -1,8 +1,10 @@
 """RAG query system using Gemini or GPT-5."""
 
 import json as _json
-import google.generativeai as genai
-from openai import AzureOpenAI
+from google import genai
+from google.genai import types as genai_types
+from openai import AzureOpenAI, OpenAI
+from concurrent.futures import ThreadPoolExecutor
 from typing import Generator, Optional
 import logging
 import os
@@ -14,14 +16,13 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # =============================================================================
-# LLM PROVIDER TOGGLE - Set to "gemini" or "gpt5"
+# LLM PROVIDER TOGGLE - Set to "gemini", "gpt5", or "deepseek"
 # =============================================================================
-LLM_PROVIDER = "gpt5"
+LLM_PROVIDER = "deepseek"
 # =============================================================================
 
 # Configure Gemini
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
+gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 # Configure Azure OpenAI GPT-5
 AZURE_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "")
@@ -35,6 +36,15 @@ azure_client = AzureOpenAI(
     api_key=AZURE_API_KEY,
 )
 
+# Configure DeepSeek
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+DEEPSEEK_MODEL = "deepseek-chat"
+
+deepseek_client = OpenAI(
+    api_key=DEEPSEEK_API_KEY,
+    base_url="https://api.deepseek.com",
+) if DEEPSEEK_API_KEY else None
+
 
 SYSTEM_PROMPT = """You are an expert analyst of the Epstein court documents.
 Your role is to answer questions based ONLY on the provided document excerpts.
@@ -46,7 +56,7 @@ Guidelines:
 - Be precise about names, dates, and facts
 - Distinguish between allegations and proven facts
 - Note that many people mentioned in these documents were not accused of wrongdoing
-- Cite which document excerpt(s) you're drawing from
+- Cite documents by their filename (e.g. EFTA00081180) rather than by number
 
 Context from court documents:
 {context}
@@ -60,7 +70,7 @@ def format_context(results: list[dict]) -> str:
         source = result.get("source", "Unknown")
         text = result.get("text", "")
         score = result.get("score", 0)
-        context_parts.append(f"[Excerpt {i} - Source: {source} (relevance: {score:.2f})]\n{text}")
+        context_parts.append(f"[Document: {source} (relevance: {score:.2f})]\n{text}")
     return "\n\n---\n\n".join(context_parts)
 
 
@@ -70,24 +80,43 @@ def compose_prompt(query: str, context: str) -> str:
 
 User Question: {query}
 
-Please provide a thorough answer based on the document excerpts above. Cite specific excerpts when making claims."""
+Please provide a thorough answer based on the documents above. Cite specific documents by their filename (e.g. EFTA00081180) when making claims."""
+
+
+GEMINI_SAFETY = [
+    genai_types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_NONE"),
+    genai_types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_NONE"),
+    genai_types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_NONE"),
+    genai_types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE"),
+]
 
 
 def query_gemini(prompt: str, model_name: str = GEMINI_MODEL) -> str:
     """Send a prompt to Gemini and get a response."""
     try:
-        safety_settings = [
-            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-        ]
-        model = genai.GenerativeModel(model_name, safety_settings=safety_settings)
-        response = model.generate_content(prompt)
+        response = gemini_client.models.generate_content(
+            model=model_name,
+            contents=prompt,
+            config=genai_types.GenerateContentConfig(safety_settings=GEMINI_SAFETY),
+        )
         return response.text
     except Exception as e:
         logger.error(f"Gemini API error: {e}")
         raise
+
+
+def query_gemini_streaming(prompt: str, model_name: str = GEMINI_MODEL) -> Generator[str, None, None]:
+    """Stream tokens from Gemini."""
+    for chunk in gemini_client.models.generate_content_stream(
+        model=model_name,
+        contents=prompt,
+        config=genai_types.GenerateContentConfig(safety_settings=GEMINI_SAFETY),
+    ):
+        try:
+            if chunk.text:
+                yield chunk.text
+        except (ValueError, AttributeError):
+            continue
 
 
 def query_gpt5(prompt: str) -> str:
@@ -103,9 +132,25 @@ def query_gpt5(prompt: str) -> str:
         raise
 
 
+def query_deepseek(prompt: str) -> str:
+    """Send a prompt to DeepSeek and get a response."""
+    try:
+        response = deepseek_client.chat.completions.create(
+            model=DEEPSEEK_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        logger.error(f"DeepSeek API error: {e}")
+        raise
+
+
 def query_llm(prompt: str) -> str:
     """Send a prompt to the configured LLM provider."""
-    if LLM_PROVIDER == "gpt5":
+    if LLM_PROVIDER == "deepseek":
+        logger.info("Using DeepSeek")
+        return query_deepseek(prompt)
+    elif LLM_PROVIDER == "gpt5":
         logger.info("Using GPT-5")
         return query_gpt5(prompt)
     else:
@@ -170,7 +215,7 @@ def ask_with_context(question: str, context_texts: list[str]) -> str:
 
     Useful for testing or when you want to bypass retrieval.
     """
-    context = "\n\n---\n\n".join(f"[Excerpt {i+1}]\n{text}" for i, text in enumerate(context_texts))
+    context = "\n\n---\n\n".join(f"[Document]\n{text}" for text in context_texts)
     prompt = compose_prompt(question, context)
     return query_gemini(prompt)
 
@@ -238,10 +283,8 @@ def ask_streaming(
     # Step 2: Execute searches
     yield {"type": "status", "message": f"Searching {len(queries)} queries..."}
 
-    all_results = []
-    for q in queries:
-        results = search(q, top_k=top_k)
-        all_results.append(results)
+    with ThreadPoolExecutor(max_workers=min(len(queries), 10)) as executor:
+        all_results = list(executor.map(lambda q: search(q, top_k=top_k), queries))
 
     # Step 3: Merge and deduplicate
     merged = merge_results(all_results, top_k=top_k)
@@ -262,7 +305,7 @@ def ask_streaming(
     ]
     yield {"type": "sources", "sources": sources_for_client}
 
-    # Step 4: Generate LLM answer
+    # Step 4: Stream LLM answer token by token
     yield {"type": "status", "message": "Generating answer..."}
 
     context = format_context(merged[:50])
@@ -270,8 +313,7 @@ def ask_streaming(
 
     try:
         answer = query_llm(prompt)
+        yield {"type": "token", "token": answer}
     except Exception as e:
         yield {"type": "error", "message": f"LLM error: {e}"}
         return
-
-    yield {"type": "answer", "answer": answer}

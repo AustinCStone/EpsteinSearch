@@ -16,6 +16,7 @@ VECTOR_STORE_DIR = BASE_DIR / "vector_store"
 
 # Database for tracking progress
 PROGRESS_DB = METADATA_DIR / "progress.db"
+QUERY_LOG_DB = METADATA_DIR / "query_log.db"
 
 # API Keys
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")

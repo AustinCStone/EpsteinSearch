@@ -4,12 +4,15 @@
 import sys
 sys.path.insert(0, "/storage/epstein_llm")
 
+import asyncio
 import json
 import logging
+import queue
 import re
+import sqlite3
 import time
 from pathlib import Path
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse
 from pydantic import BaseModel
@@ -17,6 +20,7 @@ import uvicorn
 
 from src.vectorstore import search as vector_search, get_vector_store
 from src.rag import ask, ask_streaming
+from src.config import QUERY_LOG_DB
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -71,7 +75,49 @@ def _pdf_url(source: str) -> str | None:
 
 class QueryRequest(BaseModel):
     query: str
-    top_k: int = 10
+    top_k: int = 100
+
+
+# ---------------------------------------------------------------------------
+# Query logging
+# ---------------------------------------------------------------------------
+def _init_query_log():
+    """Create query log table if it doesn't exist."""
+    QUERY_LOG_DB.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(QUERY_LOG_DB)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS queries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp REAL,
+            mode TEXT,
+            query TEXT,
+            num_queries_generated INTEGER,
+            results_count INTEGER,
+            response_time_ms REAL,
+            ip_address TEXT,
+            user_agent TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+    logger.info(f"Query log ready at {QUERY_LOG_DB}")
+
+
+def _log_query(
+    mode: str, query: str, results_count: int, response_time_ms: float,
+    ip_address: str = "", user_agent: str = "", num_queries_generated: int = 0,
+):
+    """Log a query to the database."""
+    try:
+        conn = sqlite3.connect(QUERY_LOG_DB)
+        conn.execute(
+            "INSERT INTO queries (timestamp, mode, query, num_queries_generated, results_count, response_time_ms, ip_address, user_agent) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (time.time(), mode, query, num_queries_generated, results_count, response_time_ms, ip_address, user_agent),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.warning(f"Failed to log query: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -84,15 +130,23 @@ async def startup():
     store = get_vector_store()
     logger.info(f"Vector store ready — {store.size:,} vectors loaded in {time.time()-t0:.1f}s")
     _build_pdf_index()
+    _init_query_log()
 
 
 # ---------------------------------------------------------------------------
 # API endpoints
 # ---------------------------------------------------------------------------
 @app.post("/api/search")
-async def api_search(req: QueryRequest):
+async def api_search(req: QueryRequest, request: Request):
     """Raw vector search — no LLM, just retrieval."""
-    results = vector_search(req.query, top_k=req.top_k)
+    t0 = time.time()
+    results = await asyncio.to_thread(vector_search, req.query, req.top_k)
+    _log_query(
+        mode="search", query=req.query, results_count=len(results),
+        response_time_ms=(time.time() - t0) * 1000,
+        ip_address=request.client.host if request.client else "",
+        user_agent=request.headers.get("user-agent", ""),
+    )
     return {
         "query": req.query,
         "results": [
@@ -109,14 +163,44 @@ async def api_search(req: QueryRequest):
 
 
 @app.post("/api/ask")
-async def api_ask(req: QueryRequest):
+async def api_ask(req: QueryRequest, request: Request):
     """Full RAG pipeline with SSE streaming — retrieval + LLM answer."""
+    client_ip = request.client.host if request.client else ""
+    user_agent = request.headers.get("user-agent", "")
 
-    def event_stream():
-        for event in ask_streaming(req.query, top_k=req.top_k):
-            if event.get("type") == "sources":
-                for s in event.get("sources", []):
-                    s["pdf_url"] = _pdf_url(s.get("source", ""))
+    q: queue.Queue = queue.Queue()
+
+    def run_pipeline():
+        t0 = time.time()
+        num_queries = 0
+        results_count = 0
+        try:
+            for event in ask_streaming(req.query, top_k=req.top_k):
+                if event.get("type") == "queries":
+                    num_queries = len(event.get("queries", []))
+                if event.get("type") == "sources":
+                    results_count = len(event.get("sources", []))
+                    for s in event.get("sources", []):
+                        s["pdf_url"] = _pdf_url(s.get("source", ""))
+                q.put(event)
+        except Exception as e:
+            q.put({"type": "error", "message": str(e)})
+        finally:
+            _log_query(
+                mode="ask", query=req.query, results_count=results_count,
+                response_time_ms=(time.time() - t0) * 1000,
+                ip_address=client_ip, user_agent=user_agent,
+                num_queries_generated=num_queries,
+            )
+            q.put(None)  # sentinel
+
+    asyncio.get_event_loop().run_in_executor(None, run_pipeline)
+
+    async def event_stream():
+        while True:
+            event = await asyncio.to_thread(q.get)
+            if event is None:
+                break
             yield f"data: {json.dumps(event)}\n\n"
         yield 'data: {"type": "done"}\n\n'
 
@@ -136,6 +220,33 @@ async def api_pdf(source: str):
     return FileResponse(path, media_type="application/pdf", filename=f"{source}.pdf")
 
 
+@app.get("/api/stats")
+async def api_stats():
+    """Return query log statistics."""
+    conn = sqlite3.connect(QUERY_LOG_DB)
+    c = conn.cursor()
+    today = time.time() - 86400
+    stats = {}
+    c.execute("SELECT COUNT(*) FROM queries")
+    stats["total_queries"] = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM queries WHERE timestamp > ?", (today,))
+    stats["queries_last_24h"] = c.fetchone()[0]
+    c.execute("SELECT mode, COUNT(*) FROM queries GROUP BY mode")
+    stats["by_mode"] = dict(c.fetchall())
+    c.execute("SELECT AVG(response_time_ms) FROM queries")
+    avg = c.fetchone()[0]
+    stats["avg_response_ms"] = round(avg, 1) if avg else 0
+    c.execute("SELECT query, COUNT(*) as cnt FROM queries GROUP BY query ORDER BY cnt DESC LIMIT 20")
+    stats["top_queries"] = [{"query": r[0], "count": r[1]} for r in c.fetchall()]
+    c.execute("SELECT query, mode, results_count, response_time_ms, ip_address, timestamp FROM queries ORDER BY id DESC LIMIT 20")
+    stats["recent"] = [
+        {"query": r[0], "mode": r[1], "results": r[2], "time_ms": round(r[3], 1), "ip": r[4], "timestamp": r[5]}
+        for r in c.fetchall()
+    ]
+    conn.close()
+    return stats
+
+
 # ---------------------------------------------------------------------------
 # HTML UI
 # ---------------------------------------------------------------------------
@@ -147,6 +258,7 @@ HTML_PAGE = """\
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Epstein Documents RAG</title>
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script data-goatcounter="https://partlyshady.goatcounter.com/count" async src="//gc.zgo.at/count.js"></script>
 <style>
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -620,18 +732,31 @@ async function doQuery() {
             break;
           }
 
-          case "answer": {
-            const render = typeof marked !== "undefined" ? marked.parse(event.answer) : escapeHtml(event.answer);
-            answerC.innerHTML = '<div class="answer-box"><div class="label">LLM Answer</div><div class="answer-content">' + render + '</div></div>';
+          case "token": {
+            if (!answerC.dataset.buf) {
+              answerC.dataset.buf = "";
+              answerC.innerHTML = '<div class="answer-box"><div class="label">LLM Answer</div><div class="answer-content"></div></div>';
+            }
+            answerC.dataset.buf += event.token;
+            const el = answerC.querySelector(".answer-content");
+            if (el) {
+              el.innerHTML = typeof marked !== "undefined" ? marked.parse(answerC.dataset.buf) : escapeHtml(answerC.dataset.buf);
+            }
+            break;
+          }
+
+          case "done": {
             const elapsed2 = ((performance.now() - t0) / 1000).toFixed(1);
             status.className = "status";
             status.textContent = "Done in " + elapsed2 + "s";
+            delete answerC.dataset.buf;
             break;
           }
 
           case "error":
             status.className = "status error";
             status.textContent = "Error: " + event.message;
+            delete answerC.dataset.buf;
             break;
         }
       }
