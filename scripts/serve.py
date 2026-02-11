@@ -9,13 +9,17 @@ import json
 import logging
 import queue
 import re
+import secrets
 import sqlite3
 import time
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 import uvicorn
 
 from src.vectorstore import search as vector_search, get_vector_store
@@ -25,14 +29,12 @@ from src.config import QUERY_LOG_DB
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+limiter = Limiter(key_func=get_remote_address)
 app = FastAPI(title="Epstein Documents RAG")
+app.state.limiter = limiter
+app.add_middleware(SlowAPIMiddleware)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+STATS_KEY = "epstein-stats-2026"
 
 
 RAW_DIR = Path("/storage/epstein_llm/data/raw/doj_2026")
@@ -74,8 +76,15 @@ def _pdf_url(source: str) -> str | None:
 
 
 class QueryRequest(BaseModel):
-    query: str
-    top_k: int = 100
+    query: str = Field(max_length=2000)
+    top_k: int = Field(default=100, le=200)
+
+
+class ShareRequest(BaseModel):
+    query: str = Field(max_length=2000)
+    answer: str = Field(max_length=50000)
+    sources: list[dict] = Field(max_length=50)
+    queries_generated: list[str] = Field(default=[], max_length=20)
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +105,17 @@ def _init_query_log():
             response_time_ms REAL,
             ip_address TEXT,
             user_agent TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS shared_results (
+            id TEXT PRIMARY KEY,
+            created_at REAL,
+            query TEXT,
+            answer TEXT,
+            sources TEXT,
+            queries_generated TEXT,
+            view_count INTEGER DEFAULT 0
         )
     """)
     conn.commit()
@@ -137,6 +157,7 @@ async def startup():
 # API endpoints
 # ---------------------------------------------------------------------------
 @app.post("/api/search")
+@limiter.limit("60/minute")
 async def api_search(req: QueryRequest, request: Request):
     """Raw vector search — no LLM, just retrieval."""
     t0 = time.time()
@@ -163,6 +184,7 @@ async def api_search(req: QueryRequest, request: Request):
 
 
 @app.post("/api/ask")
+@limiter.limit("10/minute")
 async def api_ask(req: QueryRequest, request: Request):
     """Full RAG pipeline with SSE streaming — retrieval + LLM answer."""
     client_ip = request.client.host if request.client else ""
@@ -221,8 +243,10 @@ async def api_pdf(source: str):
 
 
 @app.get("/api/stats")
-async def api_stats():
-    """Return query log statistics."""
+async def api_stats(key: str = ""):
+    """Return query log statistics (requires ?key= param)."""
+    if key != STATS_KEY:
+        raise HTTPException(status_code=403, detail="Forbidden")
     conn = sqlite3.connect(QUERY_LOG_DB)
     c = conn.cursor()
     today = time.time() - 86400
@@ -248,8 +272,189 @@ async def api_stats():
 
 
 # ---------------------------------------------------------------------------
+# Share endpoints
+# ---------------------------------------------------------------------------
+def _gen_share_id() -> str:
+    return secrets.token_urlsafe(12)
+
+
+@app.post("/api/share")
+@limiter.limit("20/minute")
+async def api_share(req: ShareRequest, request: Request):
+    """Create a shareable link for a query result."""
+    share_id = _gen_share_id()
+    # Keep top 20 sources and strip full_text to keep payload small
+    trimmed = [
+        {k: v for k, v in s.items() if k != "full_text"}
+        for s in req.sources[:20]
+    ]
+    conn = sqlite3.connect(QUERY_LOG_DB)
+    conn.execute(
+        "INSERT INTO shared_results (id, created_at, query, answer, sources, queries_generated, view_count) VALUES (?, ?, ?, ?, ?, ?, 0)",
+        (share_id, time.time(), req.query, req.answer, json.dumps(trimmed), json.dumps(req.queries_generated)),
+    )
+    conn.commit()
+    conn.close()
+    return {"share_id": share_id, "share_url": f"/s/{share_id}"}
+
+
+@app.get("/s/{share_id}", response_class=HTMLResponse)
+async def share_page(share_id: str):
+    """Render a shared result page."""
+    conn = sqlite3.connect(QUERY_LOG_DB)
+    conn.execute("UPDATE shared_results SET view_count = view_count + 1 WHERE id = ?", (share_id,))
+    conn.commit()
+    row = conn.execute(
+        "SELECT query, answer, sources, queries_generated, created_at, view_count FROM shared_results WHERE id = ?",
+        (share_id,),
+    ).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Shared result not found")
+    query, answer, sources_json, queries_json, created_at, view_count = row
+    sources = json.loads(sources_json)
+    queries_generated = json.loads(queries_json)
+    # Inject data into the share page template
+    return SHARE_PAGE.replace("__SHARE_DATA__", json.dumps({
+        "query": query,
+        "answer": answer,
+        "sources": sources,
+        "queries_generated": queries_generated,
+        "created_at": created_at,
+        "view_count": view_count,
+    }))
+
+
+# ---------------------------------------------------------------------------
 # HTML UI
 # ---------------------------------------------------------------------------
+SHARE_PAGE = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Epstein Documents RAG — Shared Result</title>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify/dist/purify.min.js"></script>
+<script data-goatcounter="https://partlyshady.goatcounter.com/count" async src="//gc.zgo.at/count.js"></script>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+:root {
+  --bg: #0a0a0a; --surface: #141414; --border: #262626; --border-hover: #404040;
+  --text: #e0e0e0; --text-dim: #888; --accent: #c9a84c; --accent-dim: #8a6d2b;
+}
+body { background: var(--bg); color: var(--text); font-family: "SF Mono", "Cascadia Code", "Fira Code", "JetBrains Mono", monospace; font-size: 14px; line-height: 1.6; min-height: 100vh; }
+.container { max-width: 900px; margin: 0 auto; padding: 40px 20px; }
+header { text-align: center; margin-bottom: 40px; }
+header h1 { font-size: 18px; font-weight: 600; letter-spacing: 0.05em; color: var(--accent); text-transform: uppercase; }
+header p { color: var(--text-dim); font-size: 12px; margin-top: 6px; }
+.query-display { background: var(--surface); border: 1px solid var(--border); border-radius: 4px; padding: 16px 20px; margin-bottom: 16px; font-size: 15px; color: var(--text); }
+.query-display .label { font-size: 11px; color: var(--accent); text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 8px; }
+.queries-box { background: var(--surface); border: 1px solid var(--border); border-radius: 4px; padding: 12px 16px; margin-bottom: 16px; }
+.queries-box .label { font-size: 11px; color: var(--accent); text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 8px; }
+.query-chip { display: inline-block; background: rgba(201,168,76,0.1); border: 1px solid var(--accent-dim); border-radius: 3px; padding: 4px 10px; margin: 3px 4px; font-size: 12px; color: var(--text); }
+.answer-box { background: var(--surface); border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: 4px; padding: 20px 24px; margin-bottom: 24px; line-height: 1.7; }
+.answer-box .label { font-size: 11px; color: var(--accent); text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 12px; }
+.answer-content { white-space: normal; }
+.answer-content h1, .answer-content h2, .answer-content h3 { color: var(--accent); margin: 16px 0 8px; font-size: 15px; }
+.answer-content h1 { font-size: 17px; }
+.answer-content p { margin-bottom: 10px; }
+.answer-content ul, .answer-content ol { margin: 8px 0 8px 20px; }
+.answer-content li { margin-bottom: 4px; }
+.answer-content code { background: rgba(255,255,255,0.06); padding: 2px 6px; border-radius: 3px; font-size: 13px; }
+.answer-content blockquote { border-left: 3px solid var(--accent-dim); padding-left: 12px; color: var(--text-dim); margin: 10px 0; }
+.answer-content strong { color: #fff; }
+.answer-content a { color: var(--accent); }
+.results-header { font-size: 12px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 12px; }
+.source-card { background: var(--surface); border: 1px solid var(--border); border-radius: 4px; margin-bottom: 10px; transition: border-color 0.2s; }
+.source-card:hover { border-color: var(--border-hover); }
+.source-header { display: flex; justify-content: space-between; align-items: center; padding: 12px 16px; cursor: pointer; user-select: none; }
+.source-header .meta { display: flex; gap: 16px; align-items: center; }
+.source-header .doc-id { font-weight: 600; font-size: 13px; color: var(--text); }
+.source-header .score { font-size: 11px; color: var(--accent); background: rgba(201,168,76,0.1); padding: 2px 8px; border-radius: 3px; }
+.pdf-link { font-size: 11px; color: var(--accent); text-decoration: none; padding: 2px 8px; border: 1px solid var(--accent-dim); border-radius: 3px; transition: all 0.2s; }
+.pdf-link:hover { background: var(--accent-dim); color: #fff; }
+.source-header .toggle { color: var(--text-dim); font-size: 12px; transition: transform 0.2s; }
+.source-header .toggle.open { transform: rotate(90deg); }
+.source-snippet { padding: 0 16px 12px; color: var(--text-dim); font-size: 12px; line-height: 1.5; }
+.source-full { display: none; padding: 0 16px 16px; border-top: 1px solid var(--border); margin: 0 16px 16px; padding-top: 16px; font-size: 12px; line-height: 1.7; color: var(--text); white-space: pre-wrap; max-height: 500px; overflow-y: auto; }
+.source-full.visible { display: block; }
+.cta-link { display: inline-block; margin-top: 24px; color: var(--accent); text-decoration: none; font-size: 13px; border: 1px solid var(--accent-dim); padding: 8px 16px; border-radius: 4px; transition: all 0.2s; }
+.cta-link:hover { background: var(--accent-dim); color: #fff; }
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: var(--bg); }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>Epstein Documents RAG</h1>
+    <p>Shared result</p>
+  </header>
+  <div id="content"></div>
+  <a class="cta-link" href="/">Ask your own question</a>
+  <footer style="text-align:center; margin-top:48px; padding:16px 0; border-top:1px solid var(--border); font-size:11px; color:var(--text-dim);">
+    Contact: <a href="mailto:findhiddensecrets@gmail.com" style="color:var(--accent);">findhiddensecrets@gmail.com</a>
+  </footer>
+</div>
+<script>
+const data = __SHARE_DATA__;
+const container = document.getElementById("content");
+
+let html = '<div class="query-display"><div class="label">Question</div>' + escapeHtml(data.query) + '</div>';
+
+if (data.queries_generated && data.queries_generated.length > 0) {
+  let chips = "";
+  for (const q of data.queries_generated) chips += '<div class="query-chip">' + escapeHtml(q) + '</div>';
+  html += '<div class="queries-box"><div class="label">Generated Search Queries</div>' + chips + '</div>';
+}
+
+html += '<div class="answer-box"><div class="label">LLM Answer</div><div class="answer-content">'
+  + (typeof marked !== "undefined" ? DOMPurify.sanitize(marked.parse(data.answer || "")) : escapeHtml(data.answer || ""))
+  + '</div></div>';
+
+if (data.sources && data.sources.length > 0) {
+  html += '<div class="results-header">' + data.sources.length + ' source documents</div>';
+  data.sources.forEach(function(s, i) {
+    const snippet = (s.text || "").substring(0, 300).replace(/\\n/g, " ");
+    const fullText = s.full_text || s.text || "";
+    const pdfLink = s.pdf_url
+      ? '<a class="pdf-link" href="' + escapeHtml(s.pdf_url) + '" target="_blank" rel="noopener" onclick="event.stopPropagation()">View PDF</a>'
+      : "";
+    html += '<div class="source-card">'
+      + '<div class="source-header" onclick="toggleCard(' + i + ')">'
+      + '<div class="meta">'
+      + '<span class="doc-id">' + escapeHtml(s.source || "Unknown") + '</span>'
+      + '<span class="score">' + (s.score || 0).toFixed(4) + '</span>'
+      + pdfLink
+      + '</div>'
+      + '<span class="toggle" id="toggle-' + i + '">&#9654;</span>'
+      + '</div>'
+      + '<div class="source-snippet">' + escapeHtml(snippet) + (snippet.length >= 300 ? "..." : "") + '</div>'
+      + '<div class="source-full" id="full-' + i + '">' + escapeHtml(fullText) + '</div>'
+      + '</div>';
+  });
+}
+
+container.innerHTML = html;
+
+function toggleCard(i) {
+  document.getElementById("full-" + i).classList.toggle("visible");
+  document.getElementById("toggle-" + i).classList.toggle("open");
+}
+
+function escapeHtml(text) {
+  const div = document.createElement("div");
+  div.textContent = text;
+  return div.innerHTML;
+}
+</script>
+</body>
+</html>
+"""
+
 HTML_PAGE = """\
 <!DOCTYPE html>
 <html lang="en">
@@ -258,6 +463,7 @@ HTML_PAGE = """\
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Epstein Documents RAG</title>
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify/dist/purify.min.js"></script>
 <script data-goatcounter="https://partlyshady.goatcounter.com/count" async src="//gc.zgo.at/count.js"></script>
 <style>
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -595,6 +801,31 @@ header p {
   margin-right: 4px;
   animation: pulse 1s ease-in-out infinite;
 }
+
+/* Share button */
+.share-btn {
+  background: transparent;
+  color: var(--accent);
+  border: 1px solid var(--accent-dim);
+  border-radius: 4px;
+  padding: 6px 14px;
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.2s;
+  margin-top: 12px;
+}
+.share-btn:hover { background: var(--accent-dim); color: #fff; }
+.share-link {
+  margin-top: 12px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.share-link a { color: var(--accent); }
+.share-link .copied {
+  color: var(--accent);
+  margin-left: 8px;
+}
 </style>
 </head>
 <body>
@@ -626,12 +857,16 @@ header p {
   <div id="results-container"></div>
 
   <footer style="text-align:center; margin-top:48px; padding:16px 0; border-top:1px solid var(--border); font-size:11px; color:var(--text-dim);">
-    Contact: <a href="mailto:partlyshady@gmail.com" style="color:var(--accent);">partlyshady@gmail.com</a>
+    Contact: <a href="mailto:findhiddensecrets@gmail.com" style="color:var(--accent);">findhiddensecrets@gmail.com</a>
   </footer>
 </div>
 
 <script>
 let mode = "ask";
+let lastQuery = "";
+let lastAnswer = "";
+let lastSources = [];
+let lastQueriesGenerated = [];
 
 function setMode(m) {
   mode = m;
@@ -659,6 +894,10 @@ async function doQuery() {
   resultsC.innerHTML = "";
   queriesC.innerHTML = "";
   status.className = "status loading";
+  lastQuery = query;
+  lastAnswer = "";
+  lastSources = [];
+  lastQueriesGenerated = [];
 
   const t0 = performance.now();
 
@@ -720,10 +959,12 @@ async function doQuery() {
             break;
 
           case "queries":
+            lastQueriesGenerated = event.queries;
             queriesC.innerHTML = renderQueries(event.queries);
             break;
 
           case "sources": {
+            lastSources = event.sources;
             const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
             renderSources(event.sources, elapsed, resultsC);
             status.className = "status";
@@ -738,9 +979,10 @@ async function doQuery() {
               answerC.innerHTML = '<div class="answer-box"><div class="label">LLM Answer</div><div class="answer-content"></div></div>';
             }
             answerC.dataset.buf += event.token;
+            lastAnswer = answerC.dataset.buf;
             const el = answerC.querySelector(".answer-content");
             if (el) {
-              el.innerHTML = typeof marked !== "undefined" ? marked.parse(answerC.dataset.buf) : escapeHtml(answerC.dataset.buf);
+              el.innerHTML = typeof marked !== "undefined" ? DOMPurify.sanitize(marked.parse(answerC.dataset.buf)) : escapeHtml(answerC.dataset.buf);
             }
             break;
           }
@@ -750,6 +992,14 @@ async function doQuery() {
             status.className = "status";
             status.textContent = "Done in " + elapsed2 + "s";
             delete answerC.dataset.buf;
+            if (lastAnswer) {
+              const box = answerC.querySelector(".answer-box");
+              if (box) {
+                const shareDiv = document.createElement("div");
+                shareDiv.innerHTML = '<button class="share-btn" onclick="doShare(this)">Share</button>';
+                box.appendChild(shareDiv);
+              }
+            }
             break;
           }
 
@@ -811,6 +1061,31 @@ function escapeHtml(text) {
   const div = document.createElement("div");
   div.textContent = text;
   return div.innerHTML;
+}
+
+async function doShare(btn) {
+  btn.disabled = true;
+  btn.textContent = "Sharing...";
+  try {
+    const resp = await fetch("/api/share", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        query: lastQuery,
+        answer: lastAnswer,
+        sources: lastSources,
+        queries_generated: lastQueriesGenerated,
+      }),
+    });
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    const data = await resp.json();
+    const url = location.origin + data.share_url;
+    navigator.clipboard.writeText(url).catch(function(){});
+    btn.parentElement.innerHTML = '<div class="share-link">Link: <a href="' + escapeHtml(data.share_url) + '" target="_blank">' + escapeHtml(url) + '</a><span class="copied">Copied!</span></div>';
+  } catch (err) {
+    btn.textContent = "Share failed";
+    btn.disabled = false;
+  }
 }
 </script>
 </body>
